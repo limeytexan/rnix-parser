@@ -1,0 +1,13 @@
+[package]
+name = "nef-catalog-refs"
+version = "0.1.0"
+edition = "2021"
+description = "Static analysis of NEF Nix expressions for catalog attribute-path references"
+
+[dependencies]
+rnix = { path = "..", version = "0.14" }
+rowan = "0.16"
+
+[[bin]]
+name = "find-refs"
+path = "src/bin/find-refs.rs"
