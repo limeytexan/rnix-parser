@@ -18,6 +18,7 @@
 ///   direct Select   root.a.b.c
 ///   inherit-from    inherit (root.a.b) x y;  →  root.a.b.x, root.a.b.y
 use rnix::ast;
+use rnix::ast::HasEntry as _;
 use rowan::ast::AstNode;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -127,9 +128,49 @@ fn analyze_file(content: &str, roots: &HashSet<String>) -> FileInfo {
         }
     }
 
-    collect_refs(root.syntax(), &mut refs, roots);
+    let aliases = collect_aliases(root.syntax(), roots);
+    collect_refs(root.syntax(), &mut refs, roots, &aliases);
 
     FileInfo { refs, dep_args }
+}
+
+/// Build a `name → resolved_path` map from every `let`-binding whose RHS is a
+/// rooted or aliased Select.  A fixpoint loop resolves chained aliases
+/// (`org = catalogs.myorg; tk = org.toolkit;`) regardless of declaration order.
+fn collect_aliases(root: &rnix::SyntaxNode, roots: &HashSet<String>) -> HashMap<String, String> {
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        gather_let_aliases(root, roots, &mut aliases, &mut changed);
+    }
+    aliases
+}
+
+fn gather_let_aliases(
+    node: &rnix::SyntaxNode,
+    roots: &HashSet<String>,
+    aliases: &mut HashMap<String, String>,
+    changed: &mut bool,
+) {
+    if let Some(let_in) = ast::LetIn::cast(node.clone()) {
+        for entry in let_in.attrpath_values() {
+            let Some(lhs) = entry.attrpath() else { continue };
+            let attrs: Vec<ast::Attr> = lhs.attrs().collect();
+            if attrs.len() != 1 { continue }
+            let ast::Attr::Ident(ref id) = attrs[0] else { continue };
+            let Some(name) = id.ident_token().map(|t| t.text().to_string()) else { continue };
+            if aliases.contains_key(&name) { continue }
+            let Some(ast::Expr::Select(select)) = entry.value() else { continue };
+            if let Some(path) = extract_ref_path(&select, roots, aliases) {
+                aliases.insert(name, path);
+                *changed = true;
+            }
+        }
+    }
+    for child in node.children() {
+        gather_let_aliases(&child, roots, aliases, changed);
+    }
 }
 
 /// Recursive AST walk that collects refs rooted at any name in `roots`.
@@ -143,36 +184,82 @@ fn analyze_file(content: &str, roots: &HashSet<String>) -> FileInfo {
 ///
 ///   `root.a.b.c`
 ///       → emits the full path and stops descending.
-fn collect_refs(node: &rnix::SyntaxNode, refs: &mut BTreeSet<String>, roots: &HashSet<String>) {
+///
+///   `with root.a.b; body`
+///       → emits the conservative sentinel `root.a.b.*` (any attribute of
+///         root.a.b may be in use), then recurses into body only.  The
+///         namespace expression is not recursed into separately.
+fn collect_refs(
+    node: &rnix::SyntaxNode,
+    refs: &mut BTreeSet<String>,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) {
     if let Some(inherit) = ast::Inherit::cast(node.clone()) {
-        if try_handle_inherit(&inherit, refs, roots) {
+        if try_handle_inherit(&inherit, refs, roots, aliases) {
             return;
         }
     }
 
+    if let Some(with_expr) = ast::With::cast(node.clone()) {
+        if let Some(ns) = with_expr.namespace() {
+            if let Some(path) = namespace_path(&ns, roots, aliases) {
+                refs.insert(format!("{}.*", path));
+                if let Some(body) = with_expr.body() {
+                    collect_refs(body.syntax(), refs, roots, aliases);
+                }
+                return;
+            }
+        }
+        // Non-rooted `with` — fall through to normal child recursion.
+    }
+
     if let Some(select) = ast::Select::cast(node.clone()) {
-        if let Some(path) = extract_ref_path(&select, roots) {
+        if let Some(path) = extract_ref_path(&select, roots, aliases) {
             refs.insert(path);
             return;
         }
     }
 
     for child in node.children() {
-        collect_refs(&child, refs, roots);
+        collect_refs(&child, refs, roots, aliases);
+    }
+}
+
+/// Resolve a `with`-namespace expression to a rooted path string.
+/// Handles both `catalogs.myorg` (Select) and an alias ident like `org`
+/// where `org = catalogs.myorg` was bound in a surrounding `let`.
+fn namespace_path(
+    expr: &ast::Expr,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> Option<String> {
+    match expr {
+        ast::Expr::Select(select) => extract_ref_path(select, roots, aliases),
+        ast::Expr::Ident(ident) => {
+            let name = ident.ident_token()?.text().to_string();
+            if roots.contains(&name) {
+                Some(name)
+            } else {
+                aliases.get(&name).cloned()
+            }
+        }
+        _ => None,
     }
 }
 
 /// For `inherit (root.x.y) a b c;`, inserts `root.x.y.a` etc. and returns true.
-/// Returns false when the `from` expression is not a rooted Select.
+/// Returns false when the `from` expression is not a rooted or aliased Select.
 fn try_handle_inherit(
     inherit: &ast::Inherit,
     refs: &mut BTreeSet<String>,
     roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
 ) -> bool {
     let Some(from) = inherit.from() else { return false };
     let Some(from_expr) = from.expr() else { return false };
     let ast::Expr::Select(select) = from_expr else { return false };
-    let Some(base_path) = extract_ref_path(&select, roots) else { return false };
+    let Some(base_path) = extract_ref_path(&select, roots, aliases) else { return false };
 
     for attr in inherit.attrs() {
         if let ast::Attr::Ident(id) = attr {
@@ -185,17 +272,30 @@ fn try_handle_inherit(
 }
 
 /// Returns `Some("root.foo.bar")` when `select` has a root `Ident` whose name
-/// is in `roots` and a fully static attrpath.  Returns `None` otherwise.
-fn extract_ref_path(select: &ast::Select, roots: &HashSet<String>) -> Option<String> {
+/// is in `roots` (or whose name is a known alias that resolves to a rooted path)
+/// and a fully static attrpath.  Returns `None` otherwise.
+fn extract_ref_path(
+    select: &ast::Select,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> Option<String> {
     let expr = select.expr()?;
     let ast::Expr::Ident(base) = expr else { return None };
     let base_name = base.ident_token()?.text().to_string();
-    if !roots.contains(&base_name) {
+
+    // `base_path` is either the root name itself or the already-resolved alias value.
+    let base_path = if roots.contains(&base_name) {
+        base_name
+    } else if let Some(alias) = aliases.get(&base_name) {
+        alias.clone()
+    } else {
         return None;
-    }
+    };
 
     let attrpath = select.attrpath()?;
-    let mut parts = vec![base_name];
+    // Start with the (possibly multi-segment) base path as a single element so
+    // that joining with "." produces the correct full path.
+    let mut parts = vec![base_path];
     for attr in attrpath.attrs() {
         match attr {
             ast::Attr::Ident(id) => {
@@ -449,11 +549,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pattern: passthru.src string-interpolation must not create extra refs
+    // Pattern: passthru.src string-interpolation via let alias
+    // With aliasing, `queue-bin = catalogs.myorg.queue-bin` is tracked, so
+    // `${queue-bin.src}/...` correctly resolves to `catalogs.myorg.queue-bin.src`.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn passthru_src_interpolation_no_extra_refs() {
+    fn passthru_src_access_via_alias() {
         let got = refs(
             include_str!("../test_data/catalog_refs/passthru-src-access.nix"),
             &catalog_roots(),
@@ -465,9 +567,9 @@ mod tests {
                 "catalogs.myorg.python3Packages.gamma-service",
                 "catalogs.myorg.python3Packages.zeta-api",
                 "catalogs.myorg.queue-bin",
+                "catalogs.myorg.queue-bin.src",
             ])
         );
-        assert!(!got.iter().any(|r| r.contains(".src")));
     }
 
     // -----------------------------------------------------------------------
@@ -607,6 +709,111 @@ mod tests {
                 "inputs.nixpkgs.lib",
                 "inputs.devtools-flake.packages.default",
             ])
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern: `with root.a.b; body` — emits conservative sentinel root.a.b.*
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_direct_namespace_emits_sentinel() {
+        let got = refs(
+            include_str!("../test_data/catalog_refs/with-namespace.nix"),
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.*"]));
+    }
+
+    #[test]
+    fn with_namespace_does_not_emit_bare_path() {
+        // `catalogs.myorg` (without the `.*`) must not appear — the sentinel
+        // already subsumes the base path.
+        let got = refs(
+            include_str!("../test_data/catalog_refs/with-namespace.nix"),
+            &catalog_roots(),
+        );
+        assert!(!got.contains("catalogs.myorg"));
+    }
+
+    #[test]
+    fn with_alias_namespace_emits_sentinel() {
+        // `let org = catalogs.myorg; in with org; ...` resolves through the alias.
+        let got = refs(
+            "{ catalogs }: let org = catalogs.myorg; in with org; toolkit",
+            &catalog_roots(),
+        );
+        assert!(got.contains("catalogs.myorg.*"), "got: {:?}", got);
+    }
+
+    #[test]
+    fn with_non_rooted_namespace_falls_through() {
+        // `with` whose namespace is not a catalogs path must not emit a sentinel,
+        // but direct refs in the body are still found.
+        let got = refs(
+            "{ catalogs }: with { x = 1; }; catalogs.myorg.pkg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.pkg"]));
+    }
+
+    #[test]
+    fn with_body_direct_refs_still_collected() {
+        // Direct `catalogs.*` refs inside a `with` body must still be captured
+        // alongside the sentinel.
+        let got = refs(
+            "{ catalogs }: with catalogs.myorg; catalogs.other.pkg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.*", "catalogs.other.pkg"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern: aliased select — let-bound alias chains resolved transitively
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn aliased_select_single_level() {
+        // `let org = catalogs.myorg; in org.toolkit` resolves to
+        // `catalogs.myorg.toolkit` via the alias.
+        let got = refs(
+            "{ catalogs }: let org = catalogs.myorg; in org.toolkit",
+            &catalog_roots(),
+        );
+        assert_eq!(
+            got,
+            set(&["catalogs.myorg", "catalogs.myorg.toolkit"])
+        );
+    }
+
+    #[test]
+    fn aliased_select_chained() {
+        // Two-level chain: org → catalogs.myorg, toolkit → org.toolkit.
+        // Both bindings AND the final usage should be resolved.
+        let got = refs(
+            include_str!("../test_data/catalog_refs/aliased-select.nix"),
+            &catalog_roots(),
+        );
+        assert_eq!(
+            got,
+            set(&[
+                "catalogs.myorg",
+                "catalogs.myorg.toolkit",
+                "catalogs.myorg.toolkit.readVersion",
+            ])
+        );
+    }
+
+    #[test]
+    fn aliased_select_order_independent() {
+        // Aliases declared in reverse order of use: fixpoint must still resolve.
+        let got = refs(
+            "{ catalogs }: let b = a.hello; a = catalogs.myorg; in b",
+            &catalog_roots(),
+        );
+        assert_eq!(
+            got,
+            set(&["catalogs.myorg", "catalogs.myorg.hello"])
         );
     }
 }
