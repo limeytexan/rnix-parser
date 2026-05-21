@@ -82,7 +82,9 @@ fn parse_file(path: &Path, roots: &HashSet<String>) -> HashMap<String, FileInfo>
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        db.insert(stem, analyze_file(&content, roots));
+        let dir = path.parent();
+        let mut visited = HashSet::new();
+        db.insert(stem, analyze_file_at(&content, roots, dir, &mut visited));
     }
     db
 }
@@ -99,14 +101,25 @@ fn parse_dir(dir: &Path, roots: &HashSet<String>) -> HashMap<String, FileInfo> {
                 .to_string_lossy()
                 .into_owned();
             if let Ok(content) = fs::read_to_string(&path) {
-                db.insert(stem, analyze_file(&content, roots));
+                let mut visited = HashSet::new();
+                db.insert(stem, analyze_file_at(&content, roots, path.parent(), &mut visited));
             }
         }
     }
     db
 }
 
+/// Thin wrapper used by tests — no file path, so import-following is skipped.
 fn analyze_file(content: &str, roots: &HashSet<String>) -> FileInfo {
+    analyze_file_at(content, roots, None, &mut HashSet::new())
+}
+
+fn analyze_file_at(
+    content: &str,
+    roots: &HashSet<String>,
+    file_dir: Option<&Path>,
+    visited: &mut HashSet<PathBuf>,
+) -> FileInfo {
     let parse = rnix::Root::parse(content);
     let root = parse.tree();
 
@@ -130,6 +143,10 @@ fn analyze_file(content: &str, roots: &HashSet<String>) -> FileInfo {
 
     let aliases = collect_aliases(root.syntax(), roots);
     collect_refs(root.syntax(), &mut refs, roots, &aliases);
+
+    if let Some(dir) = file_dir {
+        follow_imports(root.syntax(), roots, &aliases, dir, visited, &mut refs);
+    }
 
     FileInfo { refs, dep_args }
 }
@@ -171,6 +188,105 @@ fn gather_let_aliases(
     for child in node.children() {
         gather_let_aliases(&child, roots, aliases, changed);
     }
+}
+
+/// Walk the AST looking for `(import <path>) <attrset>` applications where the
+/// attrset passes at least one root through.  When found, resolve the path
+/// relative to `file_dir`, parse the target file, and union its refs into
+/// `refs`.  `visited` (keyed by absolute PathBuf) provides cycle safety.
+fn follow_imports(
+    node: &rnix::SyntaxNode,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+    file_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    refs: &mut BTreeSet<String>,
+) {
+    if let Some(apply) = ast::Apply::cast(node.clone()) {
+        if let Some((path_str, import_roots)) = try_extract_import(&apply, roots, aliases) {
+            let target = file_dir.join(&path_str);
+            let target = fs::canonicalize(&target).unwrap_or(target);
+            if !visited.contains(&target) {
+                visited.insert(target.clone());
+                if let Ok(content) = fs::read_to_string(&target) {
+                    let import_dir = target.parent().map(Path::to_path_buf);
+                    let imported = analyze_file_at(
+                        &content,
+                        &import_roots,
+                        import_dir.as_deref(),
+                        visited,
+                    );
+                    refs.extend(imported.refs);
+                }
+            }
+        }
+    }
+    for child in node.children() {
+        follow_imports(&child, roots, aliases, file_dir, visited, refs);
+    }
+}
+
+/// Detect `(import <static-path>) <attrset>` and return `(path_str, roots_to_use)`
+/// when the attrset passes at least one root by its original name.
+fn try_extract_import(
+    apply: &ast::Apply,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> Option<(String, HashSet<String>)> {
+    let inner = match apply.lambda()? {
+        ast::Expr::Apply(a) => a,
+        _ => return None,
+    };
+    let ast::Expr::Ident(import_fn) = inner.lambda()? else { return None };
+    if import_fn.ident_token()?.text() != "import" {
+        return None;
+    }
+    let path_str = static_path_str(&inner.argument()?)?;
+    let ast::Expr::AttrSet(attrset) = apply.argument()? else { return None };
+    let passed = roots_passed_to_import(&attrset, roots, aliases);
+    if passed.is_empty() { return None; }
+    Some((path_str, passed))
+}
+
+/// Extract the text of a static path literal (`./foo.nix`, `/abs/foo.nix`).
+fn static_path_str(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::PathRel(p) => Some(p.syntax().text().to_string()),
+        ast::Expr::PathAbs(p) => Some(p.syntax().text().to_string()),
+        ast::Expr::Str(_) => static_str(expr),
+        _ => None,
+    }
+}
+
+/// Return the subset of `roots` that the attrset passes as arguments, either
+/// via `inherit catalogs;` (bare inherit) or `catalogs = <expr>;`.
+fn roots_passed_to_import(
+    attrset: &ast::AttrSet,
+    roots: &HashSet<String>,
+    _aliases: &HashMap<String, String>,
+) -> HashSet<String> {
+    let mut passed = HashSet::new();
+    for inherit in attrset.inherits() {
+        if inherit.from().is_some() { continue } // inherit-from, not a bare pass-through
+        for attr in inherit.attrs() {
+            if let ast::Attr::Ident(id) = attr {
+                if let Some(name) = id.ident_token().map(|t| t.text().to_string()) {
+                    if roots.contains(&name) { passed.insert(name); }
+                }
+            }
+        }
+    }
+    for apv in attrset.attrpath_values() {
+        let Some(lhs) = apv.attrpath() else { continue };
+        let attrs: Vec<ast::Attr> = lhs.attrs().collect();
+        if attrs.len() != 1 { continue }
+        if let ast::Attr::Ident(id) = &attrs[0] {
+            if let Some(name) = id.ident_token().map(|t| t.text().to_string()) {
+                if roots.contains(&name) { passed.insert(name); }
+            }
+        }
+    }
+    passed
 }
 
 /// Recursive AST walk that collects refs rooted at any name in `roots`.
@@ -454,6 +570,15 @@ mod tests {
 
     fn refs(content: &str, roots: &HashSet<String>) -> BTreeSet<String> {
         analyze_file(content, roots).refs
+    }
+
+    /// Like `refs` but reads from a real file path so import-following works.
+    fn refs_at(path: &str, roots: &HashSet<String>) -> BTreeSet<String> {
+        let path = Path::new(path);
+        let content = fs::read_to_string(path).expect("test fixture missing");
+        let dir = path.parent();
+        let mut visited = HashSet::new();
+        analyze_file_at(&content, roots, dir, &mut visited).refs
     }
 
     fn set(items: &[&str]) -> BTreeSet<String> {
@@ -970,5 +1095,56 @@ mod tests {
             &catalog_roots(),
         );
         assert_eq!(got, BTreeSet::new());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern: cross-file import — `import ./helper.nix { inherit catalogs; }`
+    // Requires real file I/O; uses refs_at helper.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn import_inherit_catalogs_follows_into_helper() {
+        // entry imports helper with `inherit catalogs;`; refs from helper are unioned in.
+        let got = refs_at(
+            "test_data/catalog_refs/import-entry.nix",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.toolkit.readVersion"]));
+    }
+
+    #[test]
+    fn import_explicit_catalogs_arg_followed() {
+        // `catalogs = catalogs;` explicit pass-through is equivalent to inherit.
+        let got = refs_at(
+            "test_data/catalog_refs/import-entry-explicit.nix",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.toolkit.readVersion"]));
+    }
+
+    #[test]
+    fn import_without_catalogs_not_followed() {
+        // No catalogs in the attrset arg → import is not followed.
+        let got = refs(
+            "{ catalogs }: let x = import ./import-helper.nix { foo = 1; }; in catalogs.myorg.pkg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.pkg"]));
+    }
+
+    #[test]
+    fn import_direct_refs_in_entry_still_collected() {
+        // Refs directly in the importing file appear alongside imported refs.
+        let got = refs_at(
+            "test_data/catalog_refs/import-entry-with-direct-ref.nix",
+            &catalog_roots(),
+        );
+        assert_eq!(
+            got,
+            set(&[
+                "catalogs.myorg.extra-pkg",
+                "catalogs.myorg.toolkit.readVersion",
+            ])
+        );
     }
 }
