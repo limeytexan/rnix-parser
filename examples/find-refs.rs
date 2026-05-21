@@ -40,13 +40,19 @@ fn main() {
         std::process::exit(1);
     }
 
-    let dir = PathBuf::from(positional[0]);
+    let path = PathBuf::from(positional[0]);
     let roots: HashSet<String> = positional[1..].iter().map(|s| s.to_string()).collect();
 
-    let db = parse_dir(&dir, &roots);
+    let (db, pkg_dir) = if path.is_dir() {
+        let d = path.clone();
+        (parse_dir(&path, &roots), d)
+    } else {
+        let d = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        (parse_file(&path, &roots), d)
+    };
 
     let found = if transitive {
-        collect_transitive(&db, &dir)
+        collect_transitive(db, &pkg_dir, &roots)
     } else {
         db.values().flat_map(|f| f.refs.iter().cloned()).collect()
     };
@@ -64,6 +70,20 @@ struct FileInfo {
     /// Lambda pattern args that are not in `roots` — candidates for
     /// intra-directory transitive dependency resolution.
     dep_args: Vec<String>,
+}
+
+/// Analyze a single file and return a one-entry db keyed by its stem.
+fn parse_file(path: &Path, roots: &HashSet<String>) -> HashMap<String, FileInfo> {
+    let mut db = HashMap::new();
+    if let Ok(content) = fs::read_to_string(path) {
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        db.insert(stem, analyze_file(&content, roots));
+    }
+    db
 }
 
 fn parse_dir(dir: &Path, roots: &HashSet<String>) -> HashMap<String, FileInfo> {
@@ -188,7 +208,13 @@ fn extract_ref_path(select: &ast::Select, roots: &HashSet<String>) -> Option<Str
 }
 
 /// Transitively union refs by following intra-directory package dep_args.
-fn collect_transitive(db: &HashMap<String, FileInfo>, _dir: &Path) -> BTreeSet<String> {
+/// Deps not already in `db` are lazily loaded from `dir` (tries `<name>.nix`
+/// then `<name>/default.nix`).
+fn collect_transitive(
+    mut db: HashMap<String, FileInfo>,
+    dir: &Path,
+    roots: &HashSet<String>,
+) -> BTreeSet<String> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut result: BTreeSet<String> = BTreeSet::new();
     let mut queue: Vec<String> = db.keys().cloned().collect();
@@ -197,16 +223,38 @@ fn collect_transitive(db: &HashMap<String, FileInfo>, _dir: &Path) -> BTreeSet<S
         if !visited.insert(name.clone()) {
             continue;
         }
+        if !db.contains_key(&name) {
+            if let Some(info) = load_dep(dir, &name, roots) {
+                db.insert(name.clone(), info);
+            }
+        }
         let Some(info) = db.get(&name) else { continue };
         result.extend(info.refs.iter().cloned());
-        for dep in &info.dep_args {
-            if !visited.contains(dep) && db.contains_key(dep) {
-                queue.push(dep.clone());
+        let dep_args: Vec<String> = info.dep_args.clone();
+        for dep in dep_args {
+            if !visited.contains(&dep) {
+                queue.push(dep);
             }
         }
     }
 
     result
+}
+
+/// Try to load a dep file from `dir`: first `<name>.nix`, then `<name>/default.nix`.
+fn load_dep(dir: &Path, name: &str, roots: &HashSet<String>) -> Option<FileInfo> {
+    let candidates = [
+        dir.join(format!("{}.nix", name)),
+        dir.join(name).join("default.nix"),
+    ];
+    for path in &candidates {
+        if path.is_file() {
+            if let Ok(content) = fs::read_to_string(path) {
+                return Some(analyze_file(&content, roots));
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +565,7 @@ mod tests {
         db.insert("alpha-lib".to_string(), analyze_file(file_a, &r));
         db.insert("beta-client".to_string(), analyze_file(file_b, &r));
 
-        let got = collect_transitive(&db, Path::new("."));
+        let got = collect_transitive(db, Path::new("."), &r);
         assert_eq!(
             got,
             set(&[
@@ -537,7 +585,7 @@ mod tests {
         db.insert("pkg-a".to_string(), analyze_file(file_a, &r));
         db.insert("pkg-b".to_string(), analyze_file(file_b, &r));
 
-        let got = collect_transitive(&db, Path::new("."));
+        let got = collect_transitive(db, Path::new("."), &r);
         assert_eq!(got, set(&["catalogs.myorg.x", "catalogs.myorg.y"]));
     }
 
@@ -552,7 +600,7 @@ mod tests {
         db.insert("main-pkg".to_string(), analyze_file(file_a, &r));
         db.insert("dep-pkg".to_string(), analyze_file(file_b, &r));
 
-        let got = collect_transitive(&db, Path::new("."));
+        let got = collect_transitive(db, Path::new("."), &r);
         assert_eq!(
             got,
             set(&[
