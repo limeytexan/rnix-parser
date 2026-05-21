@@ -1,9 +1,9 @@
-let
-  flake-compat = builtins.fetchTarball {
-    url = "https://github.com/edolstra/flake-compat/archive/12c64ca55c1014cdc1b16ed5a804aa8576601ff2.tar.gz";
-    sha256 = "0jm6nzb83wa6ai17ly9fzpqc40wg1viib8klq8lby54agpl213w5";
-  };
-in
-(import flake-compat {
-  src = ./.;
-}).defaultNix.default
+{ pkgs ? import <nixpkgs> {} }:
+pkgs.rustPlatform.buildRustPackage {
+  pname = "find-refs";
+  version = "0.1.0";
+  src = pkgs.lib.cleanSource ./.;
+  cargoLock.lockFile = ./Cargo.lock;
+  cargoBuildFlags = [ "-p" "nef-catalog-refs" "--bin" "find-refs" ];
+  cargoTestFlags = [ "-p" "nef-catalog-refs" ];
+}

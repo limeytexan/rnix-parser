@@ -1,88 +1,85 @@
-# rnix-parser [![Crates.io](https://img.shields.io/crates/v/rnix.svg)](http://crates.io/crates/rnix) [![Chat on Matrix](https://matrix.to/img/matrix-badge.svg)](https://matrix.to/#/#rnix-lsp:matrix.org)
+# nef-catalog-refs
 
-rnix is a parser for the [Nix language](https://nixos.org/nix/) written in Rust.
+Static analyzer for NEF (Nix Expression Format) package files. Scans `.nix`
+package expressions and reports every `catalogs.*` (or other root) attribute-path
+reference — without running the Nix evaluator.
 
-This can be used to manipulate the Nix AST and can for example be used for:
+Built on top of [rnix-parser](https://github.com/nix-community/rnix-parser), a
+Rust CST/AST library for Nix.
 
-- Interactively render Nix on a GUI
-- Formatting Nix code
-- Rename identifiers
+## find-refs
 
-and a lot more!
-
-rnix nowadays uses [@matklad](https://github.com/matklad)'s
-[rowan](https://crates.io/crates/rowan) crate to ensure:
-
-- all span information is preserved, meaning you can use the AST to for
-  example apply highlighting
-- printing out the AST prints out 100% the original code. This is not an
-  over-exaggeration, even completely invalid nix code such as this README can
-  be intact after a parsing session (though the AST will mark errnous nodes)
-- easy ways to walk the tree without resorting to recursion
-
-## Demo
-
-Examples can be found in the `examples/` directory. 
-
-You may also want to see
-[nix-explorer](https://gitlab.com/jD91mZM2/nix-explorer): An example
-that highlights AST nodes in Nix code. This demonstrates how
-whitespaces and commands are preserved.
-
-## Hacking
-
-Tests can be run with `cargo test`.
-
-In order to update all `.expect`-files to the currently expected results,
-you may run `UPDATE_TESTS=1 cargo test`.
-
-You can parse Nix expressions from standard input using the `from-stdin` example.
-To try that, run the following in your shell:
-
-```sh
-echo "[hello nix]" | cargo run --quiet --example from-stdin
+```
+find-refs <pkgs-dir-or-file> <root>... [--transitive]
 ```
 
-## Release Checklist
+| Argument | Description |
+|---|---|
+| `<pkgs-dir-or-file>` | A NEF `pkgs/` directory or a single `.nix` file |
+| `<root>` | Root name(s) to search for — e.g. `catalogs`, `inputs`, or both |
+| `--transitive` | Also follow intra-directory package dep args (cycle-safe) |
 
-* Ensure that all PRs that were scheduled for the release are merged (or optionally move
-  them to another milestone).
-* Close the milestone for the release (if any).
-* Run `cargo test` on `master` (or the branch to release from) with all changes being pulled in.
-* Apply the following patch to [nixpkgs-fmt](https://github.com/nix-community/nixpkgs-fmt):
-  ```diff
-  diff --git a/Cargo.toml b/Cargo.toml
-  index 0891350..edad471 100644
-  --- a/Cargo.toml
-  +++ b/Cargo.toml
-  @@ -13,6 +13,9 @@ repository = "https://github.com/nix-community/nixpkgs-fmt"
-   [workspace]
-   members = [ "./wasm" ]
-   
-  +[patch.crates-io]
-  +rnix = { path = "/home/ma27/Projects/rnix-parser" }
-  +
-   [dependencies]
-   rnix = "0.9.0"
-   smol_str = "0.1.17"
-  ```
+Output is a sorted, deduplicated list of `<root>.<path>` strings, one per line.
 
-  and run `cargo test`.
+### Reference forms handled
 
-  While it's planned to add [fuzzing to `rnix-parser` as well](https://github.com/nix-community/rnix-parser/issues/32),
-  `nixpkgs-fmt` has a decent test-suite that would've helped to catch regressions in the past.
+| Form | Nix example | Output |
+|---|---|---|
+| Direct select | `catalogs.myorg.pkg` | `catalogs.myorg.pkg` |
+| inherit-from | `inherit (catalogs.myorg.toolkit) readVersion;` | `catalogs.myorg.toolkit.readVersion` |
+| with expression | `with catalogs.myorg; ...` | `catalogs.myorg.*` (conservative) |
+| let alias | `let org = catalogs.myorg; in org.pkg` | `catalogs.myorg`, `catalogs.myorg.pkg` |
+| Dynamic attr | `catalogs.myorg.${name}` | `catalogs.myorg.*` |
+| builtins.getAttr | `builtins.getAttr "pkg" catalogs.myorg` | `catalogs.myorg.pkg` |
+| Cross-file import | `import ./helper.nix { inherit catalogs; }` | refs unioned from helper file |
 
-  __Note:__ API changes are OK (and fixes should be contributed to `nixpkgs-fmt`), behavioral changes
-  are not unless explicitly discussed before.
-* Update the [CHANGELOG.md](https://github.com/nix-community/rnix-parser/blob/master/CHANGELOG.md).
-* Bump the version number in [Cargo.toml](https://github.com/nix-community/rnix-parser/blob/master/Cargo.toml) & re-run `cargo build` to refresh the lockfile.
-* Commit & run `nix build`.
-* Tag the release and push everything.
-* As soon as the CI has completed, run `cargo publish`.
+## Building
 
-# RIP jd91mzm2
+### With flakes
 
-Sadly, the original author of this project, [@jD91mZM2 has passed
-away](https://www.redox-os.org/news/open-source-mental-health/). His online
-presence was anonymous and what we have left is his code. This is but one of
-his many repos that he contributed to.
+```sh
+nix build
+./result/bin/find-refs pkgs/ catalogs --transitive
+```
+
+### Without flakes
+
+```sh
+nix-build
+./result/bin/find-refs pkgs/ catalogs --transitive
+```
+
+### With Cargo
+
+```sh
+cargo build -p nef-catalog-refs --bin find-refs
+cargo test -p nef-catalog-refs
+```
+
+## Development shell
+
+```sh
+nix develop      # provides rustc, cargo, clippy, rustfmt
+```
+
+## Library usage
+
+`nef-catalog-refs` exposes a public API for embedding the analysis in other Rust
+programs:
+
+```rust
+use nef_catalog_refs::{parse_dir, collect_transitive};
+use std::collections::HashSet;
+use std::path::Path;
+
+let roots: HashSet<String> = ["catalogs".to_string()].into();
+let db = parse_dir(Path::new("pkgs/"), &roots);
+let refs = collect_transitive(db, Path::new("pkgs/"), &roots);
+for r in &refs {
+    println!("{}", r);
+}
+```
+
+## License
+
+MIT
