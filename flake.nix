@@ -1,7 +1,7 @@
 {
   description = "Static analyzer for NEF Nix expressions — finds catalog attribute-path references";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:flox/nixpkgs/stable";
 
   outputs = { self, nixpkgs }:
     let
