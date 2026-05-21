@@ -214,6 +214,13 @@ fn collect_refs(
         // Non-rooted `with` — fall through to normal child recursion.
     }
 
+    if let Some(apply) = ast::Apply::cast(node.clone()) {
+        if let Some(path) = try_handle_get_attr(&apply, roots, aliases) {
+            refs.insert(path);
+            return;
+        }
+    }
+
     if let Some(select) = ast::Select::cast(node.clone()) {
         if let Some(path) = extract_ref_path(&select, roots, aliases) {
             refs.insert(path);
@@ -246,6 +253,65 @@ fn namespace_path(
         }
         _ => None,
     }
+}
+
+/// Detect `builtins.getAttr "name" <expr>` (or bare `getAttr "name" <expr>`).
+/// Returns `Some("resolved.path.name")` when the target resolves to a rooted
+/// path and the key is a static string, or `Some("resolved.path.*")` when the
+/// key is dynamic.  Returns `None` for non-`getAttr` applications.
+fn try_handle_get_attr(
+    apply: &ast::Apply,
+    roots: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> Option<String> {
+    // Shape: (getAttr "key") target  — two curried applications.
+    let inner = match apply.lambda()? {
+        ast::Expr::Apply(a) => a,
+        _ => return None,
+    };
+    if !is_get_attr_fn(&inner.lambda()?) {
+        return None;
+    }
+    let base_path = namespace_path(&apply.argument()?, roots, aliases)?;
+    match static_str(&inner.argument()?) {
+        Some(key) => Some(format!("{}.{}", base_path, key)),
+        None => Some(format!("{}.*", base_path)), // dynamic key
+    }
+}
+
+/// True when `expr` is `builtins.getAttr` or the bare builtin `getAttr`.
+fn is_get_attr_fn(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Select(sel) => {
+            let Some(ast::Expr::Ident(base)) = sel.expr() else { return false };
+            if base.ident_token().map_or(true, |t| t.text() != "builtins") {
+                return false;
+            }
+            let Some(path) = sel.attrpath() else { return false };
+            let attrs: Vec<ast::Attr> = path.attrs().collect();
+            attrs.len() == 1
+                && matches!(&attrs[0], ast::Attr::Ident(id)
+                    if id.ident_token().map_or(false, |t| t.text() == "getAttr"))
+        }
+        ast::Expr::Ident(id) => id.ident_token().map_or(false, |t| t.text() == "getAttr"),
+        _ => false,
+    }
+}
+
+/// Extract the text content of a purely static (non-interpolated) string literal.
+fn static_str(expr: &ast::Expr) -> Option<String> {
+    let ast::Expr::Str(s) = expr else { return None };
+    if s.syntax().children().next().is_some() {
+        return None; // interpolation nodes present
+    }
+    s.syntax().children_with_tokens().find_map(|n| {
+        if let rowan::NodeOrToken::Token(t) = n {
+            if t.kind() == rnix::SyntaxKind::TOKEN_STRING_CONTENT {
+                return Some(t.text().to_string());
+            }
+        }
+        None
+    })
 }
 
 /// For `inherit (root.x.y) a b c;`, inserts `root.x.y.a` etc. and returns true.
@@ -301,7 +367,12 @@ fn extract_ref_path(
             ast::Attr::Ident(id) => {
                 parts.push(id.ident_token()?.text().to_string());
             }
-            _ => return None, // dynamic / interpolated attr — skip
+            _ => {
+                // Dynamic or interpolated attr — the static prefix is known but
+                // the specific key is not; emit a wildcard sentinel and stop.
+                parts.push("*".to_string());
+                break;
+            }
         }
     }
     Some(parts.join("."))
@@ -815,5 +886,89 @@ mod tests {
             got,
             set(&["catalogs.myorg", "catalogs.myorg.hello"])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern: dynamic attr access — catalogs.myorg.${name}
+    // Emits sentinel root.prefix.* when attrpath contains a dynamic component.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dynamic_attr_emits_sentinel() {
+        let got = refs(
+            "{ catalogs, name }: catalogs.myorg.${name}",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.*"]));
+    }
+
+    #[test]
+    fn dynamic_attr_at_first_component_emits_root_sentinel() {
+        let got = refs(
+            "{ catalogs, org }: catalogs.${org}.pkg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.*"]));
+    }
+
+    #[test]
+    fn dynamic_attr_stops_at_first_dynamic_component() {
+        // Only the path up to (and including) the first dynamic component
+        // should appear; further static components are dropped.
+        let got = refs(
+            "{ catalogs, name }: catalogs.myorg.${name}.subpkg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.*"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pattern: builtins.getAttr "name" <expr>
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_attr_static_key_qualified() {
+        let got = refs(
+            "{ catalogs }: builtins.getAttr \"hello\" catalogs.myorg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.hello"]));
+    }
+
+    #[test]
+    fn get_attr_static_key_bare() {
+        // `getAttr` without `builtins.` prefix (it's a global builtin).
+        let got = refs(
+            "{ catalogs }: getAttr \"hello\" catalogs.myorg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.hello"]));
+    }
+
+    #[test]
+    fn get_attr_dynamic_key_emits_sentinel() {
+        let got = refs(
+            "{ catalogs, name }: builtins.getAttr name catalogs.myorg",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg.*"]));
+    }
+
+    #[test]
+    fn get_attr_with_alias_target() {
+        let got = refs(
+            "{ catalogs, name }: let org = catalogs.myorg; in builtins.getAttr \"hello\" org",
+            &catalog_roots(),
+        );
+        assert_eq!(got, set(&["catalogs.myorg", "catalogs.myorg.hello"]));
+    }
+
+    #[test]
+    fn get_attr_non_rooted_target_ignored() {
+        let got = refs(
+            "{ catalogs }: builtins.getAttr \"hello\" someOtherAttrset",
+            &catalog_roots(),
+        );
+        assert_eq!(got, BTreeSet::new());
     }
 }
